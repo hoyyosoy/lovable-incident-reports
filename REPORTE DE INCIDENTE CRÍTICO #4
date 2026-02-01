@@ -1,0 +1,215 @@
+# REPORTE DE INCIDENTE CRÍTICO #4 - DIGNUS
+## Error de Aislamiento de Datos en Cierre de Mes
+
+**Fecha:** 1 de febrero de 2026  
+**Severidad:** CRÍTICA  
+**Componente Afectado:** `MonthEndClosing.tsx`  
+**Estado:** Sin corregir  
+
+---
+
+## 1. DESCRIPCIÓN DEL ERROR
+
+El componente "Cierre de Mes" (`MonthEndClosing.tsx`) muestra datos financieros **de TODAS las residenciales combinadas** en lugar de mostrar solo los datos de la residencial seleccionada (Aqua).
+
+### Evidencia Visual (Screenshot del Usuario)
+- **Ingresos mostrados:** $2,474,710.00
+- **Gastos mostrados:** $1,621,362.00
+- **Resultado Neto:** $853,348.00
+
+### Datos Reales Verificados en Base de Datos
+
+| Residencial | Ingresos Reales | Gastos Reales |
+|-------------|-----------------|---------------|
+| **Aqua** | $775,500 | $560,336 |
+| Arenas | $925,000 | $298,108 |
+| Pinares | $774,210 | $55,057 |
+| Los Lagos | $0 | $363,216 |
+| La Soñada | $0 | $329,045 |
+| Altos de La Paz | $0 | $10,000 |
+| Demo | $0 | $5,600 |
+| **TOTAL (incorrecto)** | **$2,474,710** | **$1,621,362** |
+
+El sistema está sumando transacciones de **7 residenciales diferentes** y mostrándolas como si fueran de Aqua.
+
+---
+
+## 2. UBICACIÓN EXACTA DEL BUG
+
+### Archivo: `src/components/MonthEndClosing.tsx`
+
+#### Bug #1: Función `calculateCurrentMonthData` (líneas 345-377)
+
+```typescript
+const calculateCurrentMonthData = async () => {
+  // ❌ BUG: NO HAY FILTRO POR home_id
+  const { data: incomeData } = await supabase
+    .from('transactions')
+    .select('amount')
+    .eq('transaction_type', 'income')
+    .gte('date', `${targetMonth}-01`)
+    .lte('date', `${targetMonth}-31`);
+    // ❌ FALTA: .eq('home_id', selectedHome?.id)
+
+  // ❌ BUG: NO HAY FILTRO POR home_id
+  const { data: expenseData } = await supabase
+    .from('transactions')
+    .select('amount')
+    .eq('transaction_type', 'expense')
+    .gte('date', `${targetMonth}-01`)
+    .lte('date', `${targetMonth}-31`);
+    // ❌ FALTA: .eq('home_id', selectedHome?.id)
+};
+```
+
+#### Bug #2: Función `loadBudgetVariances` (líneas 379-412)
+
+```typescript
+const loadBudgetVariances = async () => {
+  // ❌ BUG: NO HAY FILTRO POR home_id
+  const { data: budgets } = await supabase
+    .from('monthly_budgets')
+    .select(`...`)
+    .eq('month_year', targetMonth);
+    // ❌ FALTA: .eq('home_id', selectedHome?.id)
+};
+```
+
+---
+
+## 3. IMPACTO DEL ERROR
+
+### 3.1 ¿Afecta a todos los residenciales?
+**SÍ** - Este error afecta a TODAS las residenciales porque el código NO filtra por `home_id`.
+
+### 3.2 ¿Se puede cerrar el mes confiando en los números?
+**NO** - Los números mostrados son completamente incorrectos:
+
+| Métrica | Valor Incorrecto | Valor Correcto (Aqua) | Error |
+|---------|-----------------|----------------------|-------|
+| Ingresos | $2,474,710 | $775,500 | **+219%** |
+| Gastos | $1,621,362 | $560,336 | **+189%** |
+| Resultado | $853,348 | $215,164 | **+297%** |
+
+### 3.3 ¿Se puede crear febrero?
+**TÉCNICAMENTE SÍ**, pero con datos corruptos de base:
+- La tabla `month_status` tiene registros con `total_income = 0` y `total_expenses = 0` para todos los residenciales
+- La función `create_new_month` SÍ filtra por `home_id` (verificado previamente)
+- Sin embargo, si el cierre de enero se realiza con datos incorrectos, el historial quedará corrupto
+
+---
+
+## 4. COMPARACIÓN DE FILTRADO EN EL CÓDIGO
+
+### Código que SÍ filtra correctamente (`useFinancialCalculations.ts`):
+```typescript
+// ✅ CORRECTO
+transactionsQuery = transactionsQuery.eq('home_id', homeId);
+budgetsQuery = budgetsQuery.eq('home_id', homeId);
+```
+
+### Código que NO filtra (`MonthEndClosing.tsx`):
+```typescript
+// ❌ INCORRECTO - Sin filtro home_id
+.eq('transaction_type', 'income')
+.gte('date', `${targetMonth}-01`)
+```
+
+---
+
+## 5. SOLUCIÓN REQUERIDA
+
+### Modificar `src/components/MonthEndClosing.tsx`:
+
+**Función `calculateCurrentMonthData` (líneas 348-360):**
+- Agregar `.eq('home_id', selectedHome?.id)` a ambas queries
+
+**Función `loadBudgetVariances` (líneas 381-388):**
+- Agregar `.eq('home_id', selectedHome?.id)` a la query
+
+### Código Corregido:
+```typescript
+const calculateCurrentMonthData = async () => {
+  if (!selectedHome?.id) return; // Guard clause
+  
+  const { data: incomeData } = await supabase
+    .from('transactions')
+    .select('amount')
+    .eq('transaction_type', 'income')
+    .eq('home_id', selectedHome.id)  // ✅ AGREGAR
+    .gte('date', `${targetMonth}-01`)
+    .lte('date', `${targetMonth}-31`);
+
+  const { data: expenseData } = await supabase
+    .from('transactions')
+    .select('amount')
+    .eq('transaction_type', 'expense')
+    .eq('home_id', selectedHome.id)  // ✅ AGREGAR
+    .gte('date', `${targetMonth}-01`)
+    .lte('date', `${targetMonth}-31`);
+};
+
+const loadBudgetVariances = async () => {
+  if (!selectedHome?.id) return; // Guard clause
+  
+  const { data: budgets } = await supabase
+    .from('monthly_budgets')
+    .select(`...`)
+    .eq('month_year', targetMonth)
+    .eq('home_id', selectedHome.id);  // ✅ AGREGAR
+};
+```
+
+---
+
+## 6. HISTORIAL DE INCIDENTES DE AISLAMIENTO
+
+Este es el **CUARTO** incidente de aislamiento de datos detectado:
+
+| # | Componente | Descripción | Estado |
+|---|------------|-------------|--------|
+| 1 | Trigger `recalc_monthly_budget_for` | Sumaba transacciones de todas las residenciales | **Corregido** |
+| 2 | Tabla `providers` | Alquileres con `home_id = NULL` | **Corregido** |
+| 3 | `sectionRouteMap` navegación | Rutas faltantes | **Corregido** |
+| 4 | `MonthEndClosing.tsx` | Resumen financiero sin filtro | **PENDIENTE** |
+
+---
+
+## 7. OPINIÓN TÉCNICA SOBRE CONFIABILIDAD
+
+### Estado Actual
+La aplicación Dignus **NO es confiable** en términos financieros en su estado actual debido a:
+
+1. **Errores sistémicos de aislamiento**: Se han encontrado 4 bugs críticos de multi-tenancy en diferentes partes del código, lo que indica que el patrón de filtrado por `home_id` no fue aplicado consistentemente durante el desarrollo.
+
+2. **Falta de validación centralizada**: No existe un interceptor o middleware que garantice el filtrado por `home_id` en todas las queries.
+
+3. **Datos históricos potencialmente corruptos**: Los presupuestos de enero 2026 tuvieron datos incorrectos que fueron corregidos manualmente. No hay garantía de que no existan otros datos corruptos.
+
+4. **Testing insuficiente**: Los errores de aislamiento deberían haber sido detectados por pruebas automatizadas antes de llegar a producción.
+
+### Recomendaciones para Recuperar Confiabilidad
+
+1. **Auditoría completa del código**: Revisar TODAS las queries a Supabase y verificar que incluyan filtro por `home_id`.
+
+2. **Implementar Row Level Security (RLS) estricto**: Aunque existe RLS, los errores en el código del frontend bypasean esta protección al no filtrar correctamente.
+
+3. **Crear tests automatizados de multi-tenancy**: Tests que verifiquen que cambios en un residencial no afectan a otros.
+
+4. **Proceso de verificación de datos**: Antes de cerrar cada mes, ejecutar un script de validación que compare totales.
+
+5. **Recalcular datos históricos**: Ejecutar una migración que recalcule `actual_amount` en todos los presupuestos de todos los meses.
+
+### Conclusión
+
+Después de meses de desarrollo, la aplicación tiene una **arquitectura sólida** y **funcionalidades completas**, pero sufre de **inconsistencias en la implementación del multi-tenancy** que comprometen su confiabilidad financiera.
+
+La buena noticia es que los errores son **corregibles** y siguen un patrón común (falta de filtro por `home_id`). Una auditoría sistemática y corrección de todos los puntos de acceso a datos resolverá el problema.
+
+**Recomendación**: NO cerrar el mes de enero ni crear febrero hasta corregir este bug y verificar la integridad de los datos.
+
+---
+
+**Preparado para:** Soporte Técnico Lovable  
+**Proyecto:** Dignus App  
+**URL:** https://dignus-app.lovable.app
