@@ -95,3 +95,10 @@ Because of this, I have currently **paused** using this version of Dignus for an
 - Incident reports: primarily **English** (so the Lovable team and international developers can read them).  
 - This README may include short notes or links in **Spanish** for local context.
 
+## Link to Original Business Rules
+
+The full business rules for Dignus (including Rule 2 – Salary Advances) are defined here:
+
+- https://github.com/hoyyosoy/dignus-app/blob/main/BUSINESS_RULES.md
+
+These rules were clearly documented **before** the incidents described in this repo. The problems shown here are implementation and consistency issues, not a lack of specification.
