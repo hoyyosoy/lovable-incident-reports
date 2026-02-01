@@ -1,0 +1,158 @@
+# Corrección: Arrastre Automático de Adelantos + Sincronización de Reglas
+
+## Problema Raíz Confirmado
+
+### 1. Función RPC sin lógica de arrastre
+La función `create_new_month` (migración 20260120184252) **no incluye** arrastre de adelantos:
+- Copia `monthly_salary`, `aguinaldo_estimado`
+- **NO** calcula ni copia `advance_payment`
+- Cada mes nuevo inicia con `advance_payment = 0` implícito
+
+### 2. Regla 18 contradice Regla 2
+- **Regla 2**: "El adelanto del mes X se descuenta al pagar el sueldo de X en el mes X+1"
+- **Regla 18**: "Los adelantos NO se arrastran" / "Cada mes inicia con advance_payment = 0"
+
+Estas dos reglas son mutuamente excluyentes.
+
+---
+
+## Flujo Correcto (Confirmado)
+
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ENERO                                │ FEBRERO                          │
+├──────────────────────────────────────┼──────────────────────────────────┤
+│ 1. Empleado trabaja                  │ 4. Usuario crea mes Febrero      │
+│ 2. Usuario da adelanto $5,000        │    → create_new_month calcula:   │
+│    → employee_advances               │    → advance_payment de ENERO    │
+│      (month_year='2026-01')          │      = SUM(adelantos de Ene)     │
+│ 3. employee_payments de Enero        │ 5. Pagar sueldo de Enero:        │
+│    tiene advance_payment = $5,000    │    → $30,000 - $5,000 = $25,000  │
+└──────────────────────────────────────┴──────────────────────────────────┘
+```
+
+**Clave**: Los adelantos NO se "arrastran" a Febrero. Se **consolidan** en employee_payments de ENERO para que al pagar el sueldo de enero (en febrero) el descuento esté aplicado.
+
+---
+
+## Plan de Corrección
+
+### Fase 1: Migración SQL - Modificar `create_new_month`
+
+Agregar lógica después de crear `employee_payments`:
+
+```sql
+-- DESPUÉS de insertar employee_payments del mes nuevo:
+-- Actualizar advance_payment del MES ANTERIOR (source_month) 
+-- con la suma de adelantos de ese mes
+
+UPDATE employee_payments ep
+SET advance_payment = COALESCE((
+  SELECT SUM(ea.amount)
+  FROM employee_advances ea
+  WHERE ea.employee_id = ep.employee_id
+    AND ea.month_year = computed_source_month
+    AND (p_home_id IS NULL OR ea.home_id = p_home_id)
+), 0)
+WHERE ep.month_year = computed_source_month
+  AND (p_home_id IS NULL OR ep.home_id = p_home_id);
+```
+
+**Nota**: Esta actualización es sobre el MES ANTERIOR (computed_source_month), no sobre el mes nuevo. Así cuando se paga el sueldo del mes anterior, el adelanto ya está reflejado.
+
+### Fase 2: Actualizar BUSINESS_RULES.md
+
+Corregir la Regla 18 para eliminar la contradicción:
+
+**ANTES (Incorrecto)**:
+```markdown
+### ⚠️ Importante
+- Los adelantos NO se arrastran al mes siguiente
+- Cada mes inicia con `advance_payment = 0`
+- Los adelantos viven en el mes que fueron entregados
+```
+
+**DESPUÉS (Correcto)**:
+```markdown
+### ⚠️ Importante
+- Los adelantos de un mes se consolidan en `employee_payments.advance_payment` de ESE mes
+- Al crear un mes nuevo, `create_new_month` sincroniza los adelantos del mes anterior
+- Esto asegura que al pagar el sueldo del mes X (en mes X+1), los adelantos ya estén descontados
+```
+
+### Fase 3: Actualizar UI de CreateNewMonth.tsx
+
+Cambiar la información mostrada al usuario:
+
+**Archivo**: `src/components/CreateNewMonth.tsx` (líneas 337-348)
+
+**ANTES**:
+```typescript
+<strong>⚠️ Acción manual requerida:</strong>
+<li className="text-amber-700">Adelantos de sueldo no descontados → registrar manualmente si corresponde</li>
+```
+
+**DESPUÉS**:
+```typescript
+// Mover a la sección "Se arrastra automáticamente:"
+<li className="text-amber-700">Adelantos de sueldo → se sincronizan en employee_payments del mes anterior</li>
+```
+
+---
+
+## Verificación de Impacto
+
+### Código que usa `advance_payment` (verificado):
+
+| Archivo | Uso | ¿Afectado? |
+|---------|-----|------------|
+| `useEmployeeAdvances.ts` | Actualiza advance_payment al crear/eliminar | NO - sigue funcionando |
+| `AdvancedEmployeesManagement.tsx` | Muestra advance_payment en formulario | NO |
+| `EmployeePaymentCalculator.tsx` | Calcula balance con advance_payment | NO |
+| Trigger `sync_employee_payment_amount_to_pay` | Calcula balance | NO |
+
+### Flujo de datos (verificado):
+
+1. **Crear adelanto**: `useEmployeeAdvances` → actualiza `employee_payments.advance_payment` del mismo mes ✓
+2. **Eliminar adelanto**: `useEmployeeAdvances` → decrementa `advance_payment` ✓
+3. **Crear mes nuevo**: `create_new_month` → (FALTA) sincronizar adelantos del mes anterior
+
+---
+
+## Archivos a Modificar
+
+| Archivo | Cambio | Líneas |
+|---------|--------|--------|
+| Nueva migración SQL | Actualizar `create_new_month` | +15 |
+| `BUSINESS_RULES.md` | Corregir Regla 18 | ~8 |
+| `src/components/CreateNewMonth.tsx` | Actualizar UI información | ~10 |
+
+**Total**: 3 archivos, ~33 líneas modificadas
+
+---
+
+## Migración de Datos Existentes
+
+Para corregir datos de Enero 2026 que ya existen:
+
+```sql
+-- Sincronizar adelantos existentes de Enero a employee_payments de Enero
+UPDATE employee_payments ep
+SET advance_payment = COALESCE((
+  SELECT SUM(ea.amount)
+  FROM employee_advances ea
+  WHERE ea.employee_id = ep.employee_id
+    AND ea.month_year = '2026-01'
+    AND ea.home_id = ep.home_id
+), 0)
+WHERE ep.month_year = '2026-01';
+```
+
+---
+
+## Resultado Esperado Post-Implementación
+
+1. **Crear nuevo mes** → `create_new_month` sincroniza `advance_payment` del mes anterior
+2. **Pagar sueldo** → El descuento de adelantos ya está aplicado automáticamente
+3. **Reglas de negocio** → Regla 2 y Regla 18 consistentes sin contradicción
+4. **UI** → Muestra correctamente que los adelantos se arrastran automáticamente
