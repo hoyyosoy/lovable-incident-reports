@@ -1,0 +1,143 @@
+# Corrección: MonthSelector y CreateNewMonth - Incidente #8 Extendido
+
+## Problemas Identificados
+
+### 1. Query ejecutada con home_id vacío
+```typescript
+// MonthSelector.tsx línea 76
+.eq('home_id', selectedHome?.id || '')  // ← Si selectedHome es null, busca home_id = ''
+```
+
+**Resultado**: TODOS los meses muestran "Sin datos" porque no hay registros con `home_id = ''`.
+
+### 2. Badges contradictorios
+La UI muestra simultáneamente:
+- "Abierto" (sugiere mes activo/editable)
+- "Sin inicializar" (sugiere mes vacío)
+
+Esto es confuso: ¿está abierto o no existe?
+
+### 3. Timing de carga
+El `MonthSelector` se renderiza en `Navigation` antes de que `HomeContext` termine de cargar `selectedHome`.
+
+---
+
+## Solución
+
+### Fase 1: MonthSelector - Esperar a que Home cargue
+
+**Archivo:** `src/components/MonthSelector.tsx`
+
+Cambios:
+1. Verificar que `selectedHome?.id` existe antes de ejecutar query
+2. Mostrar estado de carga mientras Home no está disponible
+3. Simplificar badges: mostrar solo UN estado claro por mes
+
+```typescript
+// Línea 68-106: Modificar useEffect
+useEffect(() => {
+  const loadMonthStatuses = async () => {
+    // ✅ NO ejecutar query si no hay home seleccionado
+    if (!selectedHome?.id) {
+      setMonthOptions(generateMonthOptions([], []));
+      setLoading(false);
+      return;
+    }
+    
+    try {
+      const [statusResult, budgetResult] = await Promise.all([
+        supabase
+          .from('month_status')
+          .select('month_year, is_closed')
+          .eq('home_id', selectedHome.id),  // ✅ Ya validado arriba
+        supabase
+          .from('monthly_budgets')
+          .select('month_year')
+          .eq('home_id', selectedHome.id)   // ✅ Ya validado arriba
+      ]);
+      // ... resto igual
+    }
+  };
+  loadMonthStatuses();
+}, [selectedHome?.id]);
+```
+
+### Fase 2: Clarificar badges en dropdown
+
+**Lógica de badges simplificada:**
+
+| Estado real | Badge mostrado |
+|-------------|----------------|
+| Sin presupuestos | "Requiere inicialización" (naranja) |
+| Con presupuestos + abierto | "Abierto" (verde) |
+| Con presupuestos + cerrado | "Cerrado" (gris) |
+
+```typescript
+// En DropdownMenuItem, líneas 186-201
+<div className="flex items-center gap-1">
+  {!option.isInitialized ? (
+    // Solo mostrar badge de no inicializado
+    <span className="text-[9px] px-1 py-0.5 rounded font-medium bg-orange-500/20 text-orange-700">
+      Requiere inicialización
+    </span>
+  ) : (
+    // Solo mostrar Abierto/Cerrado si está inicializado
+    <span className={cn(...)}>
+      {option.isClosed ? "Cerrado" : "Abierto"}
+    </span>
+  )}
+</div>
+```
+
+### Fase 3: Badge en header simplificado
+
+```typescript
+// Líneas 147-169: Simplificar badges del botón trigger
+{!currentOption.isInitialized ? (
+  <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-orange-500/20 text-orange-700 flex items-center gap-1">
+    <AlertCircle className="h-2.5 w-2.5" /> Requiere inicialización
+  </span>
+) : (
+  <span className={cn(
+    "text-[10px] px-1.5 py-0.5 rounded font-medium",
+    currentOption.isClosed 
+      ? "bg-stone-500/20 text-stone-600" 
+      : "bg-emerald-600/20 text-emerald-700"
+  )}>
+    {currentOption.isClosed ? "Cerrado" : "Abierto"}
+  </span>
+)}
+```
+
+---
+
+## Archivos a Modificar
+
+| Archivo | Cambio |
+|---------|--------|
+| `src/components/MonthSelector.tsx` | Validar selectedHome antes de query + simplificar badges |
+
+---
+
+## Resultado Esperado
+
+### Antes (problemático)
+- Todos los meses muestran "Sin datos" + "Abierto"
+- Enero 2026 (con 121 presupuestos) aparece igual que Marzo 2026 (vacío)
+- Confusión total
+
+### Después (corregido)
+- Enero 2026: "Abierto" (verde) - tiene datos
+- Febrero 2026: "Requiere inicialización" (naranja)
+- Marzo 2026: "Requiere inicialización" (naranja)
+- Claridad sobre qué meses necesitan ser creados
+
+---
+
+## Nota sobre Costos
+
+Este fix es mínimo y quirúrgico:
+- 1 archivo modificado
+- ~30 líneas de código ajustadas
+- Sin cambios en lógica de negocio
+- Solo corrección de timing y UX
