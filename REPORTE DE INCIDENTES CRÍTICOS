@@ -1,0 +1,170 @@
+# REPORTE DE INCIDENTES CRÍTICOS - DIGNUS
+## Para Soporte Técnico de Lovable
+**Fecha del Reporte:** 1 de febrero de 2026  
+**Severidad:** CRÍTICA  
+**Ambiente:** Producción
+
+---
+
+## RESUMEN EJECUTIVO
+
+Se han identificado **3 errores críticos** que afectan la integridad de datos y la confiabilidad del sistema multi-inquilino. Estos errores representan una regresión grave en la arquitectura de aislamiento de datos que fue implementada y probada anteriormente.
+
+---
+
+## INCIDENTE #1: CORRUPCIÓN DE DATOS EN PRESUPUESTOS MENSUALES
+
+### Descripción
+El campo `actual_amount` en la tabla `monthly_budgets` contiene valores incorrectos que no corresponden a la suma real de transacciones filtradas por `home_id`.
+
+### Evidencia Técnica
+
+| Categoría | Home | actual_amount (BD) | Transacciones Reales | Diferencia |
+|-----------|------|-------------------|---------------------|------------|
+| Alimentación | Aqua | $333,338 | $114,811 | **+$218,527** |
+| Cargas Sociales | Aqua | $427,240 | Pendiente verificar | Significativa |
+| Publicidad | Aqua | $17,370 | Pendiente verificar | Significativa |
+| Servicios Básicos | Aqua | $172,203 | Pendiente verificar | Significativa |
+
+### Consulta de Verificación
+```sql
+SELECT 
+  (SELECT SUM(amount) FROM transactions 
+   WHERE category_id = 'e5e79b0c-5c9e-4c1a-b615-00f90da14eb1' 
+     AND home_id = 'd6960274-600e-42e6-82ff-95b8d68e5010'
+     AND date >= '2026-01-01' AND date < '2026-02-01'
+     AND transaction_type = 'expense') as transacciones_reales,
+  (SELECT actual_amount FROM monthly_budgets 
+   WHERE id = '758492f1-7281-4e51-bd38-0edaff81c8f3') as actual_en_budget;
+-- Resultado: 114811.00 vs 333338.00
+```
+
+### Causa Probable
+El trigger `recalc_monthly_budget_for` o `sync_budget_actual_amount` no está filtrando correctamente por `home_id` al sumar transacciones, causando que se agreguen datos de múltiples residenciales en un solo presupuesto.
+
+### Impacto
+- Presupuestos muestran como "Excedidos" cuando no lo están
+- Proyecciones financieras completamente erróneas
+- Pérdida de confianza en los datos del sistema
+
+---
+
+## INCIDENTE #2: FUGA DE DATOS - PROVEEDORES GLOBALES EN CHECKLIST
+
+### Descripción
+Los proveedores de categoría "Alquiler" tienen `home_id = NULL` (catálogo global), pero aparecen en el checklist de pagos de TODAS las residenciales.
+
+### Evidencia Técnica
+```sql
+SELECT p.name, p.home_id FROM providers 
+WHERE LOWER(p.name) LIKE '%alquiler%' AND p.show_in_checklist = true;
+-- Resultado: Todos tienen home_id = NULL
+```
+
+| Proveedor | home_id | Problema |
+|-----------|---------|----------|
+| ALQUILER CETRARO | NULL | Aparece en Aqua pero es de otra residencial |
+| ALQUILER FIRPO | NULL | Aparece en Aqua pero es de otra residencial |
+| ALQUILER HUMBERTO MALVIDO | NULL | Aparece en Aqua pero es de otra residencial |
+| ALQUILER LAMPARIELLO | NULL | Aparece en Aqua pero es de otra residencial |
+| ALQUILER TOBLER REF 154 | NULL | Aparece en Aqua pero es de otra residencial |
+
+### Código Problemático (MonthlyPaymentsChecklist.tsx línea 138)
+```typescript
+.or(`home_id.eq.${selectedHome.id},home_id.is.null`)
+```
+Este patrón es correcto para catálogos compartidos (insumos, bancos), pero los proveedores de alquiler son específicos de cada residencial y NO deberían tener `home_id = NULL`.
+
+### Impacto
+- Usuario ve alquileres de otras residenciales como pendientes
+- Confusión total sobre qué pagos corresponden a cada propiedad
+- Violación de privacidad de datos entre residenciales
+
+---
+
+## INCIDENTE #3: BOTÓN "VER DETALLES" NO FUNCIONA EN DASHBOARD
+
+### Descripción
+Al hacer clic en "Ver Detalles" dentro de la alerta de "Discrepancia de saldos" en el Dashboard, el sistema no navega a la sección de cuentas bancarias.
+
+### Evidencia Técnica
+El mapeo de secciones en `src/pages/Index.tsx` no incluye todas las rutas necesarias:
+
+```typescript
+const sectionRouteMap: Record<string, string> = {
+  'transactions': ROUTES.FINANCIAL_TRANSACTIONS,
+  'accounts': ROUTES.MANAGEMENT_BANK_ACCOUNTS, // ✓ Existe
+  // Faltan: 'partner-debts', 'categories', otros...
+};
+```
+
+El componente `CompactAlertsCard.tsx` pasa `navigateTo: 'accounts'` pero cuando se expande la alerta y se hace clic en "Ver detalles", la navegación no se ejecuta correctamente.
+
+### Impacto
+- Usuarios no pueden investigar discrepancias financieras
+- Flujo de trabajo interrumpido
+- Frustración del usuario
+
+---
+
+## ANÁLISIS DE CAUSA RAÍZ
+
+### Problema Fundamental
+El sistema multi-inquilino requiere aislamiento estricto por `home_id` en:
+1. **Datos transaccionales** (transacciones, pagos)
+2. **Datos maestros** (proveedores, empleados)
+3. **Datos agregados** (presupuestos, proyecciones)
+
+Los errores indican que:
+- Los triggers de sincronización NO respetan el aislamiento por `home_id`
+- Los proveedores específicos de residencial fueron configurados incorrectamente como globales
+- La lógica de navegación del Dashboard está incompleta
+
+### Referencia a Memorias del Sistema
+Las siguientes memorias documentan el comportamiento esperado que NO se está cumpliendo:
+- `memory/architecture/multi-tenancy-approach`
+- `memory/dashboard/financial-data-isolation-guard`
+- `memory/features/budget-isolation-logic`
+
+---
+
+## ACCIONES REQUERIDAS
+
+### Urgente (Crítico)
+1. **Auditar y corregir triggers de sincronización** - Verificar que `recalc_monthly_budget_for` filtre por `home_id`
+2. **Corregir datos corruptos** - Recalcular `actual_amount` para todas las categorías afectadas
+3. **Asignar `home_id` correcto a proveedores de alquiler** - Migrar de NULL al home correspondiente
+
+### Importante
+4. **Completar mapeo de navegación** - Agregar secciones faltantes en `sectionRouteMap`
+5. **Agregar validación de integridad** - Crear chequeo automático que compare actual_amount vs transacciones
+
+### Preventivo
+6. **Agregar constraints de base de datos** - Prevenir que proveedores de ciertas categorías tengan `home_id = NULL`
+7. **Implementar tests automatizados** - Verificar aislamiento multi-tenant en CI/CD
+
+---
+
+## IMPACTO EN EL NEGOCIO
+
+- **Confiabilidad:** COMPROMETIDA - Los usuarios no pueden confiar en los datos mostrados
+- **Decisiones Financieras:** AFECTADAS - Presupuestos incorrectos llevan a decisiones erróneas
+- **Privacidad:** VIOLADA - Datos de una residencial visibles en otra
+
+---
+
+## ARCHIVOS AFECTADOS
+
+| Archivo | Problema |
+|---------|----------|
+| Trigger `recalc_monthly_budget_for` | No filtra por home_id |
+| `src/components/MonthlyPaymentsChecklist.tsx` | Lógica OR incluye proveedores incorrectos |
+| `src/pages/Index.tsx` | sectionRouteMap incompleto |
+| Tabla `providers` | Alquileres con home_id = NULL |
+| Tabla `monthly_budgets` | Datos corruptos en actual_amount |
+
+---
+
+**Preparado para:** Soporte Técnico Lovable  
+**Proyecto:** Dignus App  
+**URL Producción:** https://dignus-app.lovable.app
