@@ -1,0 +1,200 @@
+# Reporte de Incidente Técnico
+## Fallo de Implementación AWS Rekognition en Supabase Edge Functions
+
+**Fecha del Reporte:** 31 de enero de 2026  
+**Proyecto:** Dignus - Sistema de Gestión de Hogares  
+**Componente Afectado:** Verificación facial biométrica para fichaje de empleados
+
+---
+
+## Resumen Ejecutivo
+
+Durante 3+ días de desarrollo intensivo, se intentó implementar verificación facial mediante AWS Rekognition en una Edge Function de Supabase (entorno Deno). **Todos los intentos fallaron** debido a incompatibilidades fundamentales entre el protocolo de firma AWS SigV4 y el entorno de ejecución Deno.
+
+El problema no es de configuración sino de **incompatibilidad estructural** entre las bibliotecas disponibles y el runtime de Deno en Supabase Edge Functions.
+
+---
+
+## Cronología de Intentos
+
+### Intento 1: aws4fetch (Recomendación inicial de Lovable)
+
+**Biblioteca:** `aws4fetch` v1.0.20  
+**Fecha:** Días 1-2  
+**Resultado:** ❌ FALLIDO
+
+```
+Error: IncompleteSignatureException
+Mensaje: 'AKIAXXX/20260130/us-east-1/rekognition/aws4_request' not a valid key=value pair (missing equal-sign) in Authorization header
+```
+
+**Análisis:** La biblioteca genera headers `Authorization` malformados que AWS rechaza. El formato esperado por AWS no coincide con el formato producido por aws4fetch en Deno.
+
+---
+
+### Intento 2: aws4fetch con múltiples configuraciones
+
+**Biblioteca:** `aws4fetch` (diversas configuraciones)  
+**Fecha:** Día 2  
+**Resultado:** ❌ FALLIDO
+
+Se probaron múltiples enfoques:
+- Firma manual con `AwsV4Signer`
+- Uso de `AwsClient` 
+- Diferentes formatos de headers
+- Configuraciones alternativas de región y servicio
+
+Todos produjeron el mismo error `IncompleteSignatureException`.
+
+---
+
+### Intento 3: @aws-sdk/client-rekognition (SDK oficial)
+
+**Biblioteca:** `@aws-sdk/client-rekognition` v3.x  
+**Fecha:** Día 2  
+**Resultado:** ❌ FALLIDO
+
+```
+Error: fs.readFile is not implemented
+```
+
+**Análisis:** El SDK oficial de AWS para JavaScript depende de módulos de Node.js (`fs`, `crypto` nativo) que **no están disponibles en Deno**. Esta incompatibilidad es fundamental y no tiene solución en el contexto de Edge Functions.
+
+---
+
+### Intento 4: deno_aws_sign_v4 (Biblioteca nativa Deno)
+
+**Biblioteca:** `https://deno.land/x/aws_sign_v4@1.0.2/mod.ts`  
+**Fecha:** Día 3  
+**Resultado:** ❌ FALLIDO
+
+```
+Error: IncompleteSignatureException
+Mensaje: Authorization header malformed
+```
+
+**Análisis:** Incluso una biblioteca diseñada específicamente para Deno produce firmas que AWS Rekognition rechaza. Esto sugiere que el problema puede estar en cómo AWS Rekognition valida las firmas comparado con otros servicios AWS.
+
+---
+
+## Tabla Comparativa de Bibliotecas
+
+| Biblioteca | Plataforma | Error | Causa Raíz |
+|------------|------------|-------|------------|
+| `aws4fetch` | Deno/Browser | `IncompleteSignatureException` | Header Authorization malformado |
+| `@aws-sdk/client-rekognition` | Node.js | `fs.readFile is not implemented` | Dependencias Node.js incompatibles |
+| `deno_aws_sign_v4` | Deno nativo | `IncompleteSignatureException` | Firma SigV4 no reconocida por Rekognition |
+| Firma manual | Deno | `IncompleteSignatureException` | Complejidad de SigV4 mal implementada |
+
+---
+
+## Análisis de Causa Raíz
+
+### Problema Principal
+**AWS SigV4 es extremadamente sensible al formato exacto de la firma.** Las bibliotecas disponibles para Deno no producen firmas que AWS Rekognition acepte, posiblemente debido a:
+
+1. **Diferencias en canonicalización de requests** entre implementaciones
+2. **Manejo de encoding** de caracteres especiales
+3. **Formato específico de headers** que Rekognition espera vs. otros servicios AWS
+4. **Timing/timestamp** en la firma
+
+### Problema Sistémico
+La recomendación inicial de usar `aws4fetch` vino de Lovable AI sin validación previa de que esta combinación (Deno + aws4fetch + AWS Rekognition) funciona. No existe documentación ni ejemplos de éxito de esta integración específica.
+
+---
+
+## Impacto
+
+### Recursos Consumidos
+- **Tiempo de desarrollo:** 3+ días
+- **Interacciones con AI:** 15-20+ mensajes
+- **Créditos consumidos:** Estimado significativo del plan mensual
+
+### Estado Actual del Sistema
+El código actual tiene una **vulnerabilidad de seguridad**: cuando AWS falla, el sistema permite el fallback a PIN sin verificación fotográfica, o en algunos flujos, acepta cualquier foto como evidencia.
+
+### Código Afectado
+- `supabase/functions/verify-face/index.ts` - Edge function no funcional
+- `src/components/staff/clock/FaceVerification.tsx` - Componente UI implementado pero sin backend funcional
+
+---
+
+## Solicitudes para Soporte de Lovable
+
+### 1. Reembolso de Créditos
+Solicito consideración de reembolso parcial de créditos debido a:
+- Desarrollo basado en recomendación de Lovable AI que resultó técnicamente inviable
+- Múltiples iteraciones de debugging que consumieron recursos sin resultado funcional
+- El problema era de incompatibilidad estructural, no de implementación incorrecta
+
+### 2. Actualización de Documentación
+Solicito que se actualice la documentación/conocimiento de Lovable para:
+- Advertir sobre limitaciones de AWS SigV4 en Deno Edge Functions
+- Recomendar alternativas validadas para reconocimiento facial
+- Incluir esta incompatibilidad en la base de conocimiento del AI
+
+### 3. Alternativa Técnica
+Solicito orientación sobre alternativas viables:
+- ¿Face-api.js en el navegador es una alternativa recomendada?
+- ¿Existe otro servicio de reconocimiento facial compatible con Deno?
+- ¿Se puede usar un proxy Node.js externo?
+
+---
+
+## Alternativas Propuestas
+
+### Opción A: Face-api.js (Browser-based)
+- **Pros:** No requiere Edge Functions, funciona 100% en el navegador
+- **Cons:** Mayor carga en el cliente, modelos ML que descargar (~5-10MB)
+- **Viabilidad:** Alta
+
+### Opción B: Proxy Node.js externo
+- **Pros:** SDK oficial funcionaría correctamente
+- **Cons:** Requiere infraestructura adicional fuera de Lovable
+- **Viabilidad:** Media (requiere hosting externo)
+
+### Opción C: Otro servicio de ML
+- **Pros:** Podría tener mejor compatibilidad con Deno
+- **Cons:** Requiere investigación, posibles costos adicionales
+- **Opciones:** Google Cloud Vision, Azure Face API, Cloudflare Workers AI
+
+### Opción D: Desactivar verificación facial
+- **Pros:** Sistema funcional inmediatamente
+- **Cons:** Pierde la funcionalidad de seguridad biométrica
+- **Viabilidad:** Alta (solución temporal)
+
+---
+
+## Información del Proyecto
+
+- **Nombre:** Dignus
+- **URL Preview:** https://id-preview--8d346b89-5217-47a4-b30b-462a599a1f16.lovable.app
+- **URL Publicada:** https://dignus-app.lovable.app
+- **Stack:** React + Vite + Supabase + Tailwind
+- **Funcionalidad afectada:** Fichaje de empleados con verificación biométrica
+
+---
+
+## Archivos Relevantes para Referencia
+
+```
+supabase/functions/verify-face/index.ts    # Edge function actual (no funcional)
+src/components/staff/clock/FaceVerification.tsx  # Componente UI
+src/components/staff/clock/PhotoCapture.tsx      # Captura de foto
+```
+
+---
+
+## Conclusión
+
+Este incidente representa un caso de **incompatibilidad técnica no documentada** entre AWS Rekognition y el entorno Deno de Supabase Edge Functions. La inversión de tiempo y recursos no produjo una solución funcional debido a limitaciones estructurales fuera del control del desarrollador.
+
+Se solicita consideración por parte del equipo de Lovable para:
+1. Compensación de recursos consumidos
+2. Mejora de la base de conocimiento del AI
+3. Orientación sobre alternativas viables
+
+---
+
+*Documento generado para envío a soporte de Lovable*  
+*Fecha de generación: 31 de enero de 2026*
